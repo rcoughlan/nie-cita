@@ -1,7 +1,8 @@
 #!/bin/bash
 # Install and start the monitor as a LaunchAgent on this Mac.
 #   /bin/bash scripts/mac-install.sh
-# It runs `node monitor.mjs --loop` forever in a visible Chrome window, keeps the Mac awake while
+# It runs `node monitor.mjs --loop` forever in a real (headed) Chrome window that's minimised
+# straight away and reused, so nothing pops up between checks. It keeps the Mac awake while
 # it's on mains power (caffeinate -s), restarts it if it crashes, and stays stopped once the
 # teardown date is reached (a clean exit). Logs: ~/Library/Logs/nie-cita.log
 # Undo with scripts/mac-uninstall.sh.
@@ -36,10 +37,11 @@ npm ci --silent
 npx playwright install chromium > /dev/null
 
 # Checkout of the data branch, so the watchdog on GitHub can see this Mac's log.
-# Pushes use your normal git credentials (keychain), no token needed.
+# Pushes use the gh CLI's GitHub login (set on that checkout only), no token needed.
 if [ ! -d data/.git ]; then
   git clone -q -b data https://github.com/rcoughlan/nie-cita.git data
 fi
+/bin/bash scripts/mac-data-auth.sh data
 git -C data pull -q --rebase
 git -C data push -q --dry-run && echo "data branch: push access OK"
 
@@ -67,6 +69,8 @@ cat > "$PLIST" <<EOF
   <dict>
     <key>LOOP_MINUTES</key><string>forever</string>
     <key>DATA_DIR</key><string>data</string>
+    <key>HEADED</key><string>1</string>
+    <key>MINIMISED</key><string>1</string>
     <key>PATH</key><string>$NODE_DIR:$GIT_DIR_PATH:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>

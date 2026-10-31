@@ -9,7 +9,9 @@
 //      NTFY_TOPIC (shared: slot alerts only), NTFY_ADMIN_TOPIC (Ryan only: blocks, errors),
 //      DATA_DIR (where checks.csv lives; pushed with git when set), PROXY_URL (optional),
 //      MONITOR_HOST (label in the log, e.g. pi),
-//      HEADED (default on outside CI: a normal visible Chrome window; HEADED=0 to hide it).
+//      HEADED (default on outside CI: a normal Chrome window, since the portal's firewall blocks
+//      headless Chrome; HEADED=0 to run headless), MINIMISED (default on when headed: the
+//      window is minimised straight after launch and reused, so nothing pops up between checks).
 //
 // Before each check the egress country is looked up; unless it's Spain the portal isn't touched
 // and the check is logged as `no-vpn` (or `offline` if the lookup fails).
@@ -30,7 +32,9 @@ const LOG = path.join(DATA_DIR, 'checks.csv');
 const RUNNER = (env.MONITOR_HOST || (env.RUNNER_NAME ? 'gha' : 'local')).replace(/[^\w-]/g, '');
 const ERROR_STREAK_ALERT = 5;
 const NO_VPN_ALERT_MIN = 60;
-const HEADED = env.HEADED ? !/^(0|false|no)$/i.test(env.HEADED) : !env.CI;
+const flag = (v, dflt) => (v ? !/^(0|false|no)$/i.test(v) : dflt);
+const HEADED = flag(env.HEADED, !env.CI);
+const MINIMISED = HEADED && flag(env.MINIMISED, true);
 
 // Every form of the personal values we might ever print: as given, upper/lower case,
 // without spaces, and each word of the name.
@@ -151,7 +155,9 @@ let browser, page;
 async function launch() {
   const opts = { headless: !HEADED };
   if (env.PROXY_URL) opts.proxy = { server: env.PROXY_URL };
-  if (HEADED) opts.args = ['--window-size=1280,900', '--window-position=60,60'];
+  // A minimised window would otherwise get its timers throttled, which can stall page scripts.
+  if (HEADED) opts.args = ['--window-size=1280,900', '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding', '--disable-background-timer-throttling'];
   // Prefer the installed Google Chrome; fall back to Playwright's bundled Chromium.
   try {
     const b = await chromium.launch({ ...opts, channel: 'chrome' });
@@ -175,7 +181,21 @@ async function getPage() {
   });
   page = await context.newPage();
   page.on('dialog', d => d.dismiss().catch(() => {}));
+  if (MINIMISED) await minimise(page);
   return page;
+}
+
+// Minimise the window via the DevTools protocol (works on macOS, where off-screen positions get
+// clamped back on screen). It stays minimised: navigations don't restore or focus it.
+async function minimise(p) {
+  try {
+    const cdp = await p.context().newCDPSession(p);
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+    await cdp.detach();
+  } catch {
+    console.log('could not minimise the window');
+  }
 }
 
 // ---- one check ----
@@ -186,46 +206,122 @@ async function check() {
   await page.context().clearCookies().catch(() => {});
   const body = async () => (await page.locator('body').innerText({ timeout: 15000 }).catch(() => '')) || '';
   const looksBlocked = t => /requested url was rejected|request rejected|access denied|support id|intrusion prevention/i.test(t);
+  const blockNote = t => (/intrusion prevention/i.test(t) ? 'firewall' : 'rejected');
+  let step = 'index';
+  let typed = false; // once personal data is typed, no page text is ever printed
 
-  // Landing-page diagnostics. Only ever called before any personal data is typed, so the
-  // page can't contain it; still scrubbed. Printed to the console only, never to checks.csv.
-  const diagnose = async (label, response) => {
+  // Diagnostics for unexpected pages. Only used before any personal data is typed, so the page
+  // can't contain it; still scrubbed. Printed to the console only, never to checks.csv.
+  const diagnose = async label => {
+    if (typed) return console.log(`diagnostic (${label}): step=${step} (no page details after the form)`);
     const text = (await body()).replace(/\s+/g, ' ').trim();
-    const html = await page.content().catch(() => '');
-    const markers = {
-      waf: looksBlocked(text),
-      captcha: /captcha|recaptcha|hcaptcha/i.test(html),
-      cookieBanner: /cookie/i.test(text),
-    };
-    console.log(scrub(`diagnostic (${label}): status=${response?.status() ?? 'n/a'} url=${page.url()} `
-      + `title="${await page.title().catch(() => '')}" markers=${JSON.stringify(markers)}`));
+    console.log(scrub(`diagnostic (${label}): step=${step} url=${page.url()} title="${await page.title().catch(() => '')}"`));
     console.log(scrub(`diagnostic text: ${text.slice(0, 300)}`));
   };
 
-  try {
-    const provinceRes = await page.goto(cfg.PROVINCE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await pause(2500, 5000);
-    const tramiteRes = await page.goto(cfg.TRAMITE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  // An interactive challenge (checkbox, image grid, picture captcha) means a human is needed: never
+  // solved or bypassed here. Invisible/score-based protection that a normal browser passes is fine.
+  const interactiveCaptcha = () => page.evaluate(() => {
+    const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    const challenge = [...document.querySelectorAll(
+      'iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"], iframe[src*="hcaptcha"], #captcha, img.img-thumbnail, input[name*=captcha i]:not([type=hidden])')]
+      .filter(vis);
+    const checkbox = [...document.querySelectorAll('.g-recaptcha')]
+      .filter(e => vis(e) && e.getAttribute('data-size') !== 'invisible');
+    return challenge.length + checkbox.length > 0;
+  }).catch(() => false);
+
+  // Click and wait for the page it submits to (the portal posts forms rather than using links).
+  const submit = async selector => {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
+      page.click(selector),
+    ]);
     await pause(2000, 4000);
+  };
 
-    let text = await body();
-    if (looksBlocked(text)) {
-      await diagnose('landing blocked', tramiteRes);
-      return { result: 'blocked', note: /intrusion prevention/i.test(text) ? 'firewall' : 'rejected' };
-    }
-    if (!/INTERNET CITA PREVIA/i.test(text)) {
-      await diagnose('landing', tramiteRes);
-      console.log(`diagnostic province page status=${provinceRes?.status() ?? 'n/a'}`);
-      return { result: 'error', note: 'landing page not recognised' };
-    }
+  // After each page: stop early on a block page.
+  const blockedNow = async () => {
+    const t = await body();
+    return looksBlocked(t) ? { result: 'blocked', note: blockNote(t) } : null;
+  };
 
-    await page.click('#btnEntrar');
-    await page.waitForSelector('#txtIdCitado', { timeout: 30000 });
+  try {
+    // 1. Province picker, as a person would start.
+    await page.goto(cfg.INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    if (!(await page.waitForSelector('select#form', { timeout: 45000 }).catch(() => null))) {
+      const b = await blockedNow();
+      if (b) { await diagnose('blocked'); return b; }
+      await diagnose('province picker');
+      return { result: 'error', note: 'province picker not found' };
+    }
+    await pause(2000, 4000);
+    await page.click('#cookie_action_close_header', { timeout: 3000 }).catch(() => {});
+    const province = await page.locator('select#form option').evaluateAll(
+      (opts, name) => opts.find(o => o.textContent.trim().toLowerCase() === name.toLowerCase())?.value, cfg.PROVINCE_NAME);
+    if (!province) return { result: 'error', note: 'province not listed' };
+    await page.selectOption('select#form', province);
+    await pause(1000, 2000);
+    await submit('#btnAceptar');
+
+    // 2. Office + trámite. "Cualquier oficina" is the default; changing it reloads the page.
+    step = 'office';
+    if (!(await page.waitForSelector('#sede', { timeout: 30000 }).catch(() => null))) {
+      const b = await blockedNow();
+      if (b) { await diagnose('blocked'); return b; }
+      await diagnose('office page');
+      return { result: 'error', note: 'office page not reached' };
+    }
+    if ((await page.locator('#sede').inputValue()) !== cfg.OFFICE_ID) {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
+        page.selectOption('#sede', cfg.OFFICE_ID),
+      ]);
+      await pause(1500, 3000);
+    }
+    const tramite = page.locator('select[name="tramiteGrupo[0]"]');
+    if (!(await tramite.locator(`option[value="${cfg.TRAMITE_ID}"]`).count())) {
+      return { result: 'error', note: 'tramite not offered' };
+    }
+    await tramite.selectOption(cfg.TRAMITE_ID);
     await pause(1500, 3000);
+    await submit('#btnAceptar');
 
+    // 3. Information page → Entrar.
+    step = 'info';
+    if (!(await page.waitForSelector('#btnEntrar', { timeout: 30000 }).catch(() => null))) {
+      const b = await blockedNow();
+      if (b) { await diagnose('blocked'); return b; }
+      await diagnose('info page');
+      return { result: 'error', note: 'info page not reached' };
+    }
+    await pause(1500, 3000);
+    await submit('#btnEntrar');
+
+    // 4. "Presentación sin Cl@ve" (identify by passport instead of Cl@ve), when offered.
+    step = 'access';
+    const sinClave = page.locator('input[value*="sin Cl@ve" i], a:has-text("sin Cl@ve"), button:has-text("sin Cl@ve")').first();
+    if (!(await page.locator('#txtIdCitado').count()) && await sinClave.count()) {
+      await pause(1000, 2500);
+      await sinClave.click();
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await pause(1500, 3000);
+    }
+
+    // 5. Her details. Nothing on screen is printed from here on.
+    step = 'form';
+    if (!(await page.waitForSelector('#txtIdCitado', { timeout: 30000 }).catch(() => null))) {
+      const b = await blockedNow();
+      if (b) { await diagnose('blocked'); return b; }
+      await diagnose('details form');
+      return { result: 'error', note: 'details form not reached' };
+    }
+    if (await interactiveCaptcha()) return { result: 'captcha', note: 'before form' };
+    typed = true;
     await page.check('#rdbTipoDocPas').catch(() => {});
+    await pause(500, 1200);
     await page.fill('#txtIdCitado', env.NIE_PASSPORT);
-    await pause(400, 1200);
+    await pause(600, 1500);
     await page.fill('#txtDesCitado', env.NIE_NAME);
     if (await page.locator('#txtPaisNac').count()) {
       const country = (env.NIE_COUNTRY || 'IRLANDA').toUpperCase();
@@ -233,36 +329,39 @@ async function check() {
         (opts, c) => opts.find(o => o.textContent.trim().toUpperCase() === c)?.value, country);
       if (value) await page.selectOption('#txtPaisNac', value);
     }
-    if (await page.locator('img.img-thumbnail, #captcha').count()) return { result: 'captcha' };
     await pause(1000, 2500);
+    await submit('#btnEnviar');
+    if (await interactiveCaptcha()) return { result: 'captcha', note: 'after form' };
 
-    await page.click('#btnEnviar');
-    await page.waitForSelector('#btnConsultar', { timeout: 30000 }).catch(() => {});
-    text = await body();
-    if (looksBlocked(text)) return { result: 'blocked' };
-    if (!(await page.locator('#btnConsultar').count())) return { result: 'error', note: 'request page not reached' };
+    // 6. "Solicitar Cita".
+    step = 'request';
+    const b6 = await blockedNow();
+    if (b6) return b6;
+    if (!(await page.waitForSelector('#btnConsultar', { timeout: 30000 }).catch(() => null))) {
+      await diagnose('request page');
+      return { result: 'error', note: 'request page not reached' };
+    }
     await pause(1000, 2500);
+    await submit('#btnConsultar');
 
-    await page.click('#btnConsultar');
-    await page.waitForLoadState('domcontentloaded');
-    await pause(1500, 3000);
-    text = await body();
-
+    // 7. Result. Stop here: never pick an office or slot.
+    step = 'result';
+    const text = await body();
     if (/no hay citas disponibles/i.test(text)) return { result: 'none' };
-    if (/Seleccione la oficina/i.test(text)) {
-      // Stop here. Offices listed in this dropdown are the ones with free slots right now.
+    if (await page.locator('#idSede').count()) {
       const offices = await page.locator('#idSede option').evaluateAll(
         opts => opts.filter(o => o.value).map(o => o.textContent.trim()));
       return { result: 'slots', offices };
     }
-    if (looksBlocked(text)) return { result: 'blocked' };
-    if (/captcha/i.test(text)) return { result: 'captcha' };
-    return { result: 'error', note: 'unexpected page after Solicitar Cita' };
+    if (looksBlocked(text)) return { result: 'blocked', note: blockNote(text) };
+    if (await interactiveCaptcha()) return { result: 'captcha', note: 'at result' };
+    await diagnose('result page');
+    return { result: 'error', note: 'unexpected result page' };
   } catch (e) {
     const msg = String(e.message || e);
-    if (!env.CI) console.log('debug:', scrub(msg.split('\n')[0]));
+    if (!env.CI) console.log(`debug: step=${step}`, typed ? '' : scrub(msg.split('\n')[0]));
     const category = errorCategory(msg);
-    return { result: ['timeout', 'network'].includes(category) ? 'blocked' : 'error', note: category };
+    return { result: ['timeout', 'network'].includes(category) ? 'blocked' : 'error', note: `${category} at ${step}` };
   } finally {
     // Leave the window on a blank page between checks, so nothing personal stays on screen.
     await page.goto('about:blank').catch(() => {});
@@ -277,11 +376,15 @@ async function handle(outcome) {
   const prev = readLog().filter(r => !['heartbeat', 'no-vpn', 'offline'].includes(r.result)).at(-1)?.result;
 
   if (outcome.result === 'slots') {
-    const accepted = outcome.offices.filter(o => cfg.ACCEPTED_OFFICES.some(re => re.test(o)));
-    appendLog(accepted.length ? 'slots' : 'slots_other', outcome.offices);
-    if (accepted.length && day) {
-      await notifyShared('NIE cita available - book now', `Offices with slots:\n${accepted.join('\n')}\n\nTrámite: ${cfg.TRAMITE_LABEL}\nTap to open the portal.`,
-        { priority: 'urgent', tags: 'rotating_light', click: cfg.PROVINCE_URL });
+    // Searched with "Cualquier oficina", so any office listed is valid; nearby ones are flagged.
+    const preferred = outcome.offices.filter(o => cfg.PREFERRED_OFFICES.some(re => re.test(o)));
+    const others = outcome.offices.filter(o => !preferred.includes(o));
+    appendLog(preferred.length ? 'slots' : 'slots_other', outcome.offices);
+    if (day) {
+      const lines = [...preferred.map(o => `★ ${o}`), ...others];
+      await notifyShared(preferred.length ? 'NIE cita available nearby - book now' : 'NIE cita available (further away) - book now',
+        `Offices with slots:\n${lines.join('\n') || '(office names not shown)'}\n\nPick "Cualquier oficina" and trámite: ${cfg.TRAMITE_LABEL}\nTap to open the portal.`,
+        { priority: preferred.length ? 'urgent' : 'high', tags: 'rotating_light', click: cfg.PROVINCE_URL });
     }
     return;
   }
@@ -349,11 +452,14 @@ async function egressOk() {
 }
 
 do {
-  if (await egressOk()) await handle(await check());
+  let last = null;
+  if (await egressOk()) await handle(last = await check());
   if (++sinceSave >= 10 || !loop) { saveLog(); sinceSave = 0; }
   if (!loop || pastTeardown()) break;
 
-  const interval = isDaytime(madridNow().hour) ? cfg.DAY_INTERVAL_MIN : cfg.NIGHT_INTERVAL_MIN;
+  // After a block, leave the portal alone for a good while: hammering it only extends the block.
+  const interval = ['blocked', 'captcha'].includes(last?.result) ? cfg.BLOCKED_BACKOFF_MIN
+    : isDaytime(madridNow().hour) ? cfg.DAY_INTERVAL_MIN : cfg.NIGHT_INTERVAL_MIN;
   const wait = interval * 60000 + (Math.random() * 2 - 1) * cfg.JITTER_SEC * 1000;
   if (Date.now() + wait > deadline) break;
   await sleepUntil(Date.now() + wait);

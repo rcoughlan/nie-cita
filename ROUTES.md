@@ -18,10 +18,10 @@ The portal only answers Spanish IPs, so this comes first.
 
 ## Better odds of a slot
 
-- **Widen the offices** to the whole province (`config.mjs`, `ACCEPTED_OFFICES`): Badalona, Granollers,
-  Mataró, Cornellà, Vilanova i la Geltrú, Sant Adrià, El Prat, Castelldefels, Igualada, Manresa,
-  Vic, Mollet... The UPC guidance is literally to pick "Cualquier oficina": any office in the
-  province is valid, and a train ride beats weeks of waiting.
+- **Whole province: done.** The monitor searches "Cualquier oficina" and alerts on any office
+  (Badalona, Granollers, Mataró, Cornellà, Vilanova i la Geltrú, Igualada, Manresa, Vic...), starring
+  the nearby ones (`PREFERRED_OFFICES` in `config.mjs`). This is what the UPC guidance recommends:
+  any office in the province is valid, and a train ride beats weeks of waiting.
 - **Check harder at the measured peak times.** After a week or two, `checks.csv` shows the hours
   slots appear; drop the interval to 1–2 min in those windows only.
 - **Book a later date.** The slot she books can be weeks out; what matters is getting one.
