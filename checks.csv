@@ -5,3 +5,4 @@ ts_utc,ts_madrid,result,offices,runner
 2026-10-31T11:39:11.018Z,2026-10-31 12:39,error,landing page not recognised,gha-nord
 2026-10-31T11:51:11.781Z,2026-10-31 12:51,error,landing page not recognised,gha-nord
 2026-10-31T12:17:24.529Z,2026-10-31 13:17,blocked,firewall,mac
+2026-10-31T12:18:24.758Z,2026-10-31 13:18,error,landing page not recognised,mac
