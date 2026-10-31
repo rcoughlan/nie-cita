@@ -2,13 +2,17 @@
 // it never books, never solves captchas, and never reaches the phone/email step.
 //
 //   node monitor.mjs           one check
-//   node monitor.mjs --loop    keep checking for LOOP_MINUTES (default 345)
+//   node monitor.mjs --loop    keep checking for LOOP_MINUTES (default 345; "forever" = no end)
 //   node --env-file=.env monitor.mjs   local run with secrets in a gitignored .env
 //
 // Env: NIE_PASSPORT, NIE_NAME (required), NIE_COUNTRY (default IRLANDA),
 //      NTFY_TOPIC (shared: slot alerts only), NTFY_ADMIN_TOPIC (Ryan only: blocks, errors),
 //      DATA_DIR (where checks.csv lives; pushed with git when set), PROXY_URL (optional),
-//      MONITOR_HOST (label in the log, e.g. pi), HEADED=1 (show the browser locally).
+//      MONITOR_HOST (label in the log, e.g. pi),
+//      HEADED (default on outside CI: a normal visible Chrome window; HEADED=0 to hide it).
+//
+// Before each check the egress country is looked up; unless it's Spain the portal isn't touched
+// and the check is logged as `no-vpn` (or `offline` if the lookup fails).
 //
 // Privacy: the passport and name are only ever typed into the portal form. Nothing derived
 // from them is logged, written to checks.csv or sent to ntfy: errors are reduced to a fixed
@@ -25,6 +29,8 @@ const DATA_DIR = env.DATA_DIR || '.';
 const LOG = path.join(DATA_DIR, 'checks.csv');
 const RUNNER = (env.MONITOR_HOST || (env.RUNNER_NAME ? 'gha' : 'local')).replace(/[^\w-]/g, '');
 const ERROR_STREAK_ALERT = 5;
+const NO_VPN_ALERT_MIN = 60;
+const HEADED = env.HEADED ? !/^(0|false|no)$/i.test(env.HEADED) : !env.CI;
 
 // Every form of the personal values we might ever print: as given, upper/lower case,
 // without spaces, and each word of the name.
@@ -51,6 +57,12 @@ function errorCategory(msg) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Sleep until a wall-clock time, in short steps. If the machine sleeps through it, this returns
+// once on wake and the loop does a single check: no catch-up burst.
+async function sleepUntil(t) {
+  while (Date.now() < t) await sleep(Math.min(30000, t - Date.now()));
+}
 const pause = (min, max) => sleep(min + Math.random() * (max - min));
 
 function madridNow() {
@@ -113,18 +125,67 @@ async function notify(topic, title, message, { priority = 'default', tags = '', 
 const notifyShared = (...a) => notify(env.NTFY_TOPIC, ...a);
 const notifyAdmin = (...a) => notify(env.NTFY_ADMIN_TOPIC, ...a);
 
-// ---- one check ----
+// ---- egress country: the portal only answers Spanish IPs, so don't touch it from anywhere else ----
 
-async function check(browser) {
+async function egressCountry() {
+  const lookups = [
+    ['https://ipinfo.io/country', t => t.trim()],
+    ['http://ip-api.com/line/?fields=countryCode', t => t.trim()],
+  ];
+  for (const [url, parse] of lookups) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (res.ok) {
+        const code = parse(await res.text());
+        if (/^[A-Z]{2}$/.test(code)) return code;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// ---- browser: one normal window, reused across checks (no new window popping up every time) ----
+
+let browser, page;
+
+async function launch() {
+  const opts = { headless: !HEADED };
+  if (env.PROXY_URL) opts.proxy = { server: env.PROXY_URL };
+  if (HEADED) opts.args = ['--window-size=1280,900', '--window-position=60,60'];
+  // Prefer the installed Google Chrome; fall back to Playwright's bundled Chromium.
+  try {
+    const b = await chromium.launch({ ...opts, channel: 'chrome' });
+    console.log(`browser: Google Chrome ${b.version()}${HEADED ? '' : ' (headless)'}`);
+    return b;
+  } catch {
+    const b = await chromium.launch(opts);
+    console.log(`browser: bundled Chromium ${b.version()}${HEADED ? '' : ' (headless)'}`);
+    return b;
+  }
+}
+
+async function getPage() {
+  if (page && !page.isClosed() && browser?.isConnected()) return page;
+  await browser?.close().catch(() => {});
+  browser = await launch();
   const context = await browser.newContext({
     locale: 'es-ES',
     timezoneId: 'Europe/Madrid',
-    viewport: { width: 1280, height: 900 },
+    viewport: HEADED ? null : { width: 1280, height: 900 },
   });
-  const page = await context.newPage();
+  page = await context.newPage();
   page.on('dialog', d => d.dismiss().catch(() => {}));
+  return page;
+}
+
+// ---- one check ----
+
+async function check() {
+  const page = await getPage();
+  // Start each check with a fresh portal session.
+  await page.context().clearCookies().catch(() => {});
   const body = async () => (await page.locator('body').innerText({ timeout: 15000 }).catch(() => '')) || '';
-  const looksBlocked = t => /requested url was rejected|request rejected|access denied|support id/i.test(t);
+  const looksBlocked = t => /requested url was rejected|request rejected|access denied|support id|intrusion prevention/i.test(t);
 
   // Landing-page diagnostics. Only ever called before any personal data is typed, so the
   // page can't contain it; still scrubbed. Printed to the console only, never to checks.csv.
@@ -148,7 +209,10 @@ async function check(browser) {
     await pause(2000, 4000);
 
     let text = await body();
-    if (looksBlocked(text)) { await diagnose('landing blocked', tramiteRes); return { result: 'blocked' }; }
+    if (looksBlocked(text)) {
+      await diagnose('landing blocked', tramiteRes);
+      return { result: 'blocked', note: /intrusion prevention/i.test(text) ? 'firewall' : 'rejected' };
+    }
     if (!/INTERNET CITA PREVIA/i.test(text)) {
       await diagnose('landing', tramiteRes);
       console.log(`diagnostic province page status=${provinceRes?.status() ?? 'n/a'}`);
@@ -200,7 +264,8 @@ async function check(browser) {
     const category = errorCategory(msg);
     return { result: ['timeout', 'network'].includes(category) ? 'blocked' : 'error', note: category };
   } finally {
-    await context.close().catch(() => {});
+    // Leave the window on a blank page between checks, so nothing personal stays on screen.
+    await page.goto('about:blank').catch(() => {});
   }
 }
 
@@ -209,7 +274,7 @@ async function check(browser) {
 async function handle(outcome) {
   const now = madridNow();
   const day = isDaytime(now.hour);
-  const prev = readLog().filter(r => r.result !== 'heartbeat').at(-1)?.result;
+  const prev = readLog().filter(r => !['heartbeat', 'no-vpn', 'offline'].includes(r.result)).at(-1)?.result;
 
   if (outcome.result === 'slots') {
     const accepted = outcome.offices.filter(o => cfg.ACCEPTED_OFFICES.some(re => re.test(o)));
@@ -230,9 +295,10 @@ async function handle(outcome) {
   }
 
   if (outcome.result === 'error') {
-    const recent = readLog().slice(-ERROR_STREAK_ALERT);
+    const checked = readLog().filter(r => !['heartbeat', 'no-vpn', 'offline'].includes(r.result));
+    const recent = checked.slice(-ERROR_STREAK_ALERT);
     if (recent.length === ERROR_STREAK_ALERT && recent.every(r => r.result === 'error')
-      && readLog().at(-ERROR_STREAK_ALERT - 1)?.result !== 'error') {
+      && checked.at(-ERROR_STREAK_ALERT - 1)?.result !== 'error') {
       await notifyAdmin('NIE monitor erroring', `${ERROR_STREAK_ALERT} checks in a row failed on ${RUNNER} (latest: ${outcome.note}). The portal may have changed; the script probably needs a fix.`, { priority: 'high', tags: 'warning' });
     }
   }
@@ -251,23 +317,47 @@ if (!env.NIE_PASSPORT || !env.NIE_NAME) {
   process.exit(1);
 }
 
-const launchOpts = { headless: !env.HEADED };
-if (env.PROXY_URL) launchOpts.proxy = { server: env.PROXY_URL };
-const browser = await chromium.launch(launchOpts);
 const loop = process.argv.includes('--loop');
-const deadline = Date.now() + Number(env.LOOP_MINUTES || 345) * 60000;
+const deadline = env.LOOP_MINUTES === 'forever' ? Infinity : Date.now() + Number(env.LOOP_MINUTES || 345) * 60000;
 let sinceSave = 0;
+let noVpnSince = null;
+let noVpnAlerted = false;
+
+// Gate on the egress country. Returns true when it's safe to check the portal.
+async function egressOk() {
+  if (env.PROXY_URL) return true; // the proxy decides the egress, not this machine
+  if (env.EGRESS_CHECK === '0') return true; // tests against a local fake portal only
+  const country = await egressCountry();
+  if (country === 'ES') {
+    if (noVpnAlerted) await notifyAdmin('NIE monitor back on a Spanish IP', `Checks resumed on ${RUNNER}.`, { tags: 'white_check_mark' });
+    noVpnSince = null;
+    noVpnAlerted = false;
+    return true;
+  }
+  // The country stays out of the public log; only the outcome is recorded.
+  appendLog(country ? 'no-vpn' : 'offline');
+  if (country) {
+    noVpnSince ??= Date.now();
+    if (!noVpnAlerted && isDaytime(madridNow().hour) && Date.now() - noVpnSince > NO_VPN_ALERT_MIN * 60000) {
+      noVpnAlerted = true;
+      await notifyAdmin('NIE monitor paused: not on a Spanish IP',
+        `${RUNNER} has been on a ${country} IP for over ${NO_VPN_ALERT_MIN} min, so it isn't checking. Connect NordVPN to a Spain server.`,
+        { priority: 'high', tags: 'warning' });
+    }
+  }
+  return false;
+}
 
 do {
-  await handle(await check(browser));
+  if (await egressOk()) await handle(await check());
   if (++sinceSave >= 10 || !loop) { saveLog(); sinceSave = 0; }
   if (!loop || pastTeardown()) break;
 
   const interval = isDaytime(madridNow().hour) ? cfg.DAY_INTERVAL_MIN : cfg.NIGHT_INTERVAL_MIN;
   const wait = interval * 60000 + (Math.random() * 2 - 1) * cfg.JITTER_SEC * 1000;
   if (Date.now() + wait > deadline) break;
-  await sleep(wait);
+  await sleepUntil(Date.now() + wait);
 } while (true);
 
 saveLog();
-await browser.close();
+await browser?.close().catch(() => {});

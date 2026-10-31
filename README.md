@@ -9,14 +9,15 @@ submits contact details: the booking itself is done by a person, on the official
 
 ## Status
 
-The portal only accepts connections from Spanish IPs. GitHub's runners (US, Azure) and UK home
-connections time out or get reset. So the scheduled run is off by default, and it needs one of these:
+The portal only accepts connections from Spanish IPs, and its firewall (FortiGate "Intrusion
+Prevention") blocked a headless browser on GitHub Actions even through NordVPN Spain. We don't try
+to get around that firewall. So it runs on a real machine in a normal, visible Chrome window:
 
-1. **A machine on a Spanish home connection** (recommended): a Raspberry Pi or spare laptop at the
-   flat in Barcelona (see "Running elsewhere").
-2. **NordVPN Spain on GitHub Actions**: see "NordVPN" below.
-3. **A Spanish proxy for GitHub Actions**: set a `PROXY_URL` secret (e.g. `http://user:pass@host:port`),
-   then turn the schedule on with `gh variable set MONITOR_ENABLED --body true`.
+1. **Ryan's Mac with the NordVPN app on a Spain server** (now): see "Run on Mac".
+2. **A Raspberry Pi** (later): see "Move to Pi". Best of all at the flat in Barcelona, on its home connection.
+
+The GitHub `monitor` workflow stays off (`MONITOR_ENABLED` unset); the `watchdog` workflow keeps
+watching the log the Mac/Pi pushes.
 
 If none of it works after a couple of weeks, see [ROUTES.md](ROUTES.md).
 
@@ -80,7 +81,8 @@ requirements change. Typically, for an EU student:
 
 Every check is appended to `checks.csv` on the `data` branch (time, outcome, office names or an error
 category; no personal data). Outcomes: `none`, `slots` (accepted office), `slots_other` (other offices
-only), `blocked`, `captcha`, `error`. Use it to see when slots appear and tighten the schedule.
+only), `blocked` (incl. the FortiGate firewall page), `captcha`, `error`, and `no-vpn` / `offline`
+when the machine wasn't on a Spanish IP (or had no internet), so the portal wasn't touched. Use it to see when slots appear and tighten the schedule.
 
 ## Setup
 
@@ -107,25 +109,81 @@ Spain. It needs the **service credentials**, not the account login:
    country, and the Check step shows `none` / `slots` if the portal let it through, or `blocked`.
 5. If it works: `gh variable set MONITOR_ENABLED --body true -R rcoughlan/nie-cita`.
 
-Nord's IPs are well known, so the portal may treat them like any datacenter. Only a test tells.
-Even quicker test: connect the NordVPN Mac app to Spain and run `npm run check:local` (below).
+**Result (31 Oct 2026):** Nord connected (egress ES), but the portal's FortiGate firewall returned
+403 "Intrusion Prevention" for the headless browser on Actions (run 41198512967). We don't work
+around that, so this path is parked; see "Run on Mac".
 
-## Running locally / elsewhere (Mac, Pi, laptop)
+## How it behaves on a Mac or Pi
+
+- A normal **visible Chrome window** (installed Google Chrome; Playwright's Chromium if Chrome
+  isn't there). One window, reused for every check and left on a blank page in between. No user
+  agent spoofing or anti-detection tricks.
+- Before each check it looks up the machine's public country (ipinfo.io, then ip-api.com). Not
+  Spain: it logs `no-vpn` and doesn't touch the portal. Still not Spain after an hour in the daytime:
+  one alert to the admin topic, and another when it's back.
+- After sleep it simply resumes: one check on wake, then the normal schedule. No catch-up burst.
+- After `TEARDOWN_DATE` it exits cleanly and stays stopped.
+
+## Run on Mac
 
 ```
-git clone https://github.com/rcoughlan/nie-cita && cd nie-cita
-npm ci && npx playwright install --with-deps chromium
-cp .env.example .env    # fill in the values; .env is gitignored
-npm run check:local     # one check (add HEADED=1 to .env to watch the browser)
-npm run watch:local     # keep checking for LOOP_MINUTES (default 345)
+cd ~/development/nie-cita
+cp .env.example .env    # fill in passport, name, both ntfy topics; MONITOR_HOST=mac
+npm run check:local     # one check in a visible window (NordVPN on a Spain server first)
 ```
 
-So the watchdog can see a Pi's log, give it push access to the `data` branch:
+When that single check reports `none` or `slots`, install it as a LaunchAgent so it runs all the
+time and restarts after crashes and reboots:
 
-1. github.com → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** →
-   Generate new token. Repository access: **Only select repositories** → `nie-cita`.
-   Permissions: **Contents: Read and write**. Expiry: 90 days.
-2. On the Pi, in the repo: `git clone -b data https://x-access-token:TOKEN@github.com/rcoughlan/nie-cita.git data`
-   (replace TOKEN), then set `DATA_DIR=data` and `MONITOR_HOST=pi` in `.env`.
+```
+/bin/bash scripts/mac-install.sh      # installs + starts; log in ~/Library/Logs/nie-cita.log
+/bin/bash scripts/mac-uninstall.sh    # stops + removes
+```
 
-Run `watch:local` under systemd (or cron every 6 hours with `LOOP_MINUTES=345`) so it restarts after reboots.
+The installer clones the `data` branch into `data/` and pushes the log there with your normal git
+credentials (keychain), so the GitHub watchdog sees it. No token needed on the Mac.
+
+**Keeping the Mac awake.** The LaunchAgent runs under `caffeinate -s`, which keeps the Mac awake
+while it's on **mains power** (the display can still sleep). On battery, or with the lid closed and
+no external display, macOS sleeps anyway and checks pause until it wakes. Alternatives:
+`sudo pmset -c sleep 0` (never sleep on charger, system-wide; undo with `sudo pmset -c sleep 1`), or
+just leave it plugged in with the lid open.
+
+**NordVPN.** Keep the app connected to a Spain server (Barcelona or Madrid). Everything on the Mac
+goes through Spain while it's on. If you turn it off the monitor just pauses (`no-vpn`). Nord's
+split tunnelling, if your app version has it, can't help here: it's Chrome that needs the Spanish IP.
+
+## Move to Pi
+
+1. Raspberry Pi OS **with desktop** (the browser needs a screen session; a monitor isn't needed
+   once it's set to log in automatically: `sudo raspi-config` → System → Boot / Auto login → Desktop autologin).
+2. `sudo apt install -y git chromium` and Node 22 (e.g. via fnm or NodeSource).
+3. `git clone https://github.com/rcoughlan/nie-cita && cd nie-cita && npm ci && npx playwright install chromium`
+   (on ARM, Google Chrome isn't available; it falls back to Chromium).
+4. `cp .env.example .env`, fill it in, set `MONITOR_HOST=pi` and `DATA_DIR=data`.
+5. Push access to the `data` branch for the watchdog: github.com → Settings → Developer settings →
+   **Fine-grained tokens** → only the `nie-cita` repo, **Contents: Read and write**, 90-day expiry.
+   Then `git clone -b data https://x-access-token:TOKEN@github.com/rcoughlan/nie-cita.git data`.
+6. Network: at the Barcelona flat its home connection is already Spanish, nothing else needed.
+   Anywhere else, install the NordVPN Linux app and `nordvpn connect Spain`, with `nordvpn set autoconnect on Spain`.
+7. A systemd user service, `~/.config/systemd/user/nie-cita.service`:
+
+   ```
+   [Unit]
+   Description=nie-cita monitor
+   After=graphical-session.target network-online.target
+
+   [Service]
+   WorkingDirectory=%h/nie-cita
+   Environment=LOOP_MINUTES=forever DISPLAY=:0
+   ExecStart=/usr/bin/env node --env-file=.env monitor.mjs --loop
+   Restart=on-failure
+   RestartSec=60
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   Then `systemctl --user enable --now nie-cita` and `sudo loginctl enable-linger $USER`.
+   `Restart=on-failure` keeps it stopped after the teardown date (a clean exit).
+8. Uninstall the Mac LaunchAgent once the Pi is running, so both don't check at once.
