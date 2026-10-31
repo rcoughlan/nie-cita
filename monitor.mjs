@@ -139,7 +139,7 @@ async function check(browser) {
     return { result: 'error', note: 'unexpected page after Solicitar Cita' };
   } catch (e) {
     const msg = String(e.message || e);
-    if (/ERR_CONNECTION|ERR_TIMED_OUT|net::|Timeout .* exceeded.*goto/i.test(msg)) return { result: 'blocked', note: msg.split('\n')[0] };
+    if (/net::|page\.goto: Timeout/i.test(msg)) return { result: 'blocked', note: msg.split('\n')[0] };
     return { result: 'error', note: msg.split('\n')[0] };
   } finally {
     await context.close().catch(() => {});
