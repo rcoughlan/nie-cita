@@ -1,5 +1,17 @@
 # nie-cita
 
+> **Status: dormant (paused 31 Oct 2026).** All workflows are disabled, all repo secrets and the local
+> `.env` are deleted, and nothing is scheduled. To pick it up again, see **Resuming** below.
+>
+> Where it got to: the portal only accepts Spanish IPs (NordVPN Spain works); its FortiGate firewall
+> blocks headless Chrome, so it must run headed; its F5 bot defence blocked the browser's cookies after
+> ~5 sessions in 20 minutes (a fresh incognito session got through). The steps after "Entrar" haven't
+> been confirmed live yet. No captcha appeared when booking by hand.
+>
+> **Resuming:** re-enable the `watchdog` workflow (and `monitor` only if running on Actions), re-add the
+> `NTFY_TOPIC` / `NTFY_ADMIN_TOPIC` secrets (pick new random topics), recreate `.env` from `.env.example`,
+> turn on Nord Spain, run one `npm run check:local`, then `scripts/mac-install.sh` if it reaches a result.
+
 Alert-only monitor for Barcelona-province appointments for the **EU registration certificate**
 (*POLICÍA-CERTIFICADO DE REGISTRO DE CIUDADANO DE LA U.E.*, which includes the NIE).
 
