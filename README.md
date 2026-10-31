@@ -3,15 +3,17 @@
 Alert-only monitor for Barcelona-province appointments for the **EU registration certificate**
 (*POLICÍA-CERTIFICADO DE REGISTRO DE CIUDADANO DE LA U.E.*, which includes the NIE).
 
-It walks the official portal up to the "choose an office" step, reads which offices have free
-slots, and sends a push notification. It **never books**, never solves captchas and never
+It walks the official portal the way a person does (province → "Cualquier oficina" → trámite →
+Entrar → Presentación sin Cl@ve → passport details → Solicitar Cita), stops at the result, reads
+which offices have free slots, and sends a push notification. It **never books**, never solves captchas and never
 submits contact details: the booking itself is done by a person, on the official site, for free.
 
 ## Status
 
 The portal only accepts connections from Spanish IPs, and its firewall (FortiGate "Intrusion
-Prevention") blocked a headless browser on GitHub Actions even through NordVPN Spain. We don't try
-to get around that firewall. So it runs on a real machine in a normal, visible Chrome window:
+Prevention") blocks headless Chrome, on GitHub Actions and on the Mac alike (31 Oct 2026). A normal
+headed Chrome gets through. We don't try to get around that firewall, so it runs on a real machine
+in a normal Chrome window (minimised, so it doesn't get in the way):
 
 1. **Ryan's Mac with the NordVPN app on a Spain server** (now): see "Run on Mac".
 2. **A Raspberry Pi** (later): see "Move to Pi". Best of all at the flat in Barcelona, on its home connection.
@@ -37,8 +39,8 @@ only times, outcomes and office names.
 Two topics on `ntfy.sh`. Anyone with a topic name can read it, so keep both private; neither ever
 carries personal data.
 
-- **Shared topic** (`NTFY_TOPIC`, both phones): only **NIE cita available - book now** (urgent),
-  listing the accepted offices with slots. Daytime only (07:00–01:00 Madrid). Allow it to break
+- **Shared topic** (`NTFY_TOPIC`, both phones): only **NIE cita available - book now**, listing
+  the offices with slots, nearby ones starred (urgent if a nearby one has slots, high otherwise). Daytime only (07:00–01:00 Madrid). Allow it to break
   through Do Not Disturb.
 - **Admin topic** (`NTFY_ADMIN_TOPIC`, Ryan only): monitor blocked/recovered, 5 errors in a row,
   Actions run failed, and from the watchdog: no successful check for 6h (repeated daily while down),
@@ -53,16 +55,18 @@ is sent 14 days after the first successful check (override with the `REVIEW_DATE
 
 Slots go within minutes. Have this ready:
 
-1. Open the alert, or go to https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8 (Barcelona).
-2. Trámite: **POLICÍA-CERTIFICADO DE REGISTRO DE CIUDADANO DE LA U.E.** → Aceptar → Entrar.
-3. Document: **Pasaporte**, passport number, full name exactly as in the passport → Aceptar → Solicitar Cita.
+1. Open the alert, or go to https://icp.administracionelectronica.gob.es/icpplus/index.html → **Barcelona** → Aceptar.
+2. Office: **Cualquier oficina**. Trámite: **POLICÍA-CERTIFICADO DE REGISTRO DE CIUDADANO DE LA U.E.** → Aceptar → Entrar.
+3. **Presentación sin Cl@ve** → **Pasaporte**, passport number, full name exactly as in the passport, **IRLANDA** → Aceptar → Solicitar Cita.
+   Don't use the browser's back button; if it errors, start again from step 1.
 4. Choose the office from the alert → Siguiente.
 5. Phone number and email → Siguiente.
 6. Pick a date/time, solve the captcha if shown, then enter the **SMS code** sent to the phone.
 7. Save the confirmation (*justificante*) as a PDF.
 
-Accepted offices (edit `config.mjs` to change): Barcelona city (Rambla Guipúscoa 74, Mallorca 213,
-Murcia 42, Passeig Sant Joan 189), Terrassa, Sabadell, Sant Cugat, Rubí, L'Hospitalet.
+It searches every office in the province ("Cualquier oficina"): any of them is valid. Nearby ones
+are starred in the alert (`PREFERRED_OFFICES` in `config.mjs`): Barcelona city (Mallorca 213,
+Passeig Sant Joan 189, Rambla Guipúscoa 74, Guadalajara 1), Terrassa, Sabadell, Sant Cugat, Rubí.
 
 ## What to bring to the appointment
 
@@ -80,8 +84,8 @@ requirements change. Typically, for an EU student:
 ## Check log
 
 Every check is appended to `checks.csv` on the `data` branch (time, outcome, office names or an error
-category; no personal data). Outcomes: `none`, `slots` (accepted office), `slots_other` (other offices
-only), `blocked` (incl. the FortiGate firewall page), `captcha`, `error`, and `no-vpn` / `offline`
+category; no personal data). Outcomes: `none`, `slots` (incl. a nearby office), `slots_other` (only
+offices further away), `blocked` (incl. the FortiGate firewall page), `captcha`, `error`, and `no-vpn` / `offline`
 when the machine wasn't on a Spanish IP (or had no internet), so the portal wasn't touched. Use it to see when slots appear and tighten the schedule.
 
 ## Setup
@@ -93,8 +97,10 @@ Secrets (`gh secret set NAME`): `NIE_PASSPORT`, `NIE_NAME` (as in passport), `NI
 Manual single check: Actions → monitor → Run workflow (minutes `0`).
 Admin alert test: Actions → watchdog → Run workflow (mode `test`).
 
-Schedule: every 6 hours a run starts and loops for ~5h45m: every ~4 min (±1 min) from 07:00 to
-01:00 Madrid time, every 15 min overnight (logged, no alerts). Timings live in `config.mjs`.
+Schedule (all runners): every ~10 min (±2 min) from 07:00 to 01:00 Madrid time, every ~20 min
+overnight (logged, no alerts), and 60 min after any block or captcha. The portal's F5 bot defence
+started rejecting a normal headed Chrome after ~5 full sessions in ~20 minutes, so don't go faster.
+On Actions a run starts every 6 hours and loops for ~5h45m. Timings live in `config.mjs`.
 
 ## NordVPN
 
@@ -110,14 +116,19 @@ Spain. It needs the **service credentials**, not the account login:
 5. If it works: `gh variable set MONITOR_ENABLED --body true -R rcoughlan/nie-cita`.
 
 **Result (31 Oct 2026):** Nord connected (egress ES), but the portal's FortiGate firewall returned
-403 "Intrusion Prevention" for the headless browser on Actions (run 41198512967). We don't work
-around that, so this path is parked; see "Run on Mac".
+403 "Intrusion Prevention" for the headless browser on Actions (run 41198512967). The same happens
+headless on the Mac through the Nord app, while headed Chrome gets through, so it's headless
+detection, not the IP. We don't work around that, so this path is parked; see "Run on Mac".
 
 ## How it behaves on a Mac or Pi
 
-- A normal **visible Chrome window** (installed Google Chrome; Playwright's Chromium if Chrome
-  isn't there). One window, reused for every check and left on a blank page in between. No user
-  agent spoofing or anti-detection tricks.
+- A normal **headed Chrome window** (installed Google Chrome; Playwright's Chromium if Chrome
+  isn't there), **minimised** right after launch (`MINIMISED=0` to watch it). One window, reused for
+  every check and left on a blank page in between, so nothing pops up between checks; Chrome may
+  take focus once when the monitor starts. No user agent spoofing or anti-detection tricks.
+- Captchas: none seen on the way to the form (31 Oct 2026); the portal uses invisible F5 bot
+  checks a normal browser passes. If an interactive challenge (checkbox, image grid, picture
+  captcha) ever shows, the check stops, logs `captcha` and alerts the admin topic. It's never solved.
 - Before each check it looks up the machine's public country (ipinfo.io, then ip-api.com). Not
   Spain: it logs `no-vpn` and doesn't touch the portal. Still not Spain after an hour in the daytime:
   one alert to the admin topic, and another when it's back.
@@ -129,7 +140,7 @@ around that, so this path is parked; see "Run on Mac".
 ```
 cd ~/development/nie-cita
 cp .env.example .env    # fill in passport, name, both ntfy topics; MONITOR_HOST=mac
-npm run check:local     # one check in a visible window (NordVPN on a Spain server first)
+npm run check:local     # one check (minimised Chrome window; NordVPN on a Spain server first)
 ```
 
 When that single check reports `none` or `slots`, install it as a LaunchAgent so it runs all the
@@ -140,8 +151,9 @@ time and restarts after crashes and reboots:
 /bin/bash scripts/mac-uninstall.sh    # stops + removes
 ```
 
-The installer clones the `data` branch into `data/` and pushes the log there with your normal git
-credentials (keychain), so the GitHub watchdog sees it. No token needed on the Mac.
+The installer clones the `data` branch into `data/` and points that checkout at the gh CLI's
+GitHub login (`scripts/mac-data-auth.sh`, local to that checkout), so the log is pushed and the
+GitHub watchdog sees it. No token needed on the Mac.
 
 **Keeping the Mac awake.** The LaunchAgent runs under `caffeinate -s`, which keeps the Mac awake
 while it's on **mains power** (the display can still sleep). On battery, or with the lid closed and
