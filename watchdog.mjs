@@ -8,6 +8,7 @@
 //      REVIEW_DATE (YYYY-MM-DD; default 14 days after the first successful check).
 
 import fs from 'node:fs';
+import { TEARDOWN_DATE } from './config.mjs';
 
 const env = process.env;
 const file = process.argv[2] || 'data/checks.csv';
@@ -37,6 +38,21 @@ async function notify(title, message, priority = 'default') {
 
 if (MODE === 'test') {
   await notify('NIE watchdog test', 'Admin alerts reach this phone. Only you get these; slot alerts go to the shared topic.');
+  process.exit(0);
+}
+
+// Teardown: one reminder 7 days before, one on the day (both at the daily hour), then silence.
+const today = now.toISOString().slice(0, 10);
+const weekBefore = new Date(Date.parse(TEARDOWN_DATE) - 7 * 86400000).toISOString().slice(0, 10);
+const atDailyHour = now.getUTCHours() === DAILY_UTC_HOUR;
+if (today === weekBefore && atDailyHour) {
+  await notify('NIE monitor: teardown in 7 days', `The monitor stops on ${TEARDOWN_DATE}. If she's booked already, tell Claude "booked" to tear it down now. See TEARDOWN.md.`);
+}
+if (today >= TEARDOWN_DATE) {
+  if (today === TEARDOWN_DATE && atDailyHour) {
+    await notify('NIE monitor: deadline reached - run teardown', 'The monitor has stopped. Tell Claude to run the TEARDOWN.md checklist (delete secrets, make the repo private, reset Nord credentials).', 'high');
+  }
+  console.log(`Teardown date ${TEARDOWN_DATE} reached: watchdog idle.`);
   process.exit(0);
 }
 

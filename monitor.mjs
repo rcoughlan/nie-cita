@@ -126,15 +126,34 @@ async function check(browser) {
   const body = async () => (await page.locator('body').innerText({ timeout: 15000 }).catch(() => '')) || '';
   const looksBlocked = t => /requested url was rejected|request rejected|access denied|support id/i.test(t);
 
+  // Landing-page diagnostics. Only ever called before any personal data is typed, so the
+  // page can't contain it; still scrubbed. Printed to the console only, never to checks.csv.
+  const diagnose = async (label, response) => {
+    const text = (await body()).replace(/\s+/g, ' ').trim();
+    const html = await page.content().catch(() => '');
+    const markers = {
+      waf: looksBlocked(text),
+      captcha: /captcha|recaptcha|hcaptcha/i.test(html),
+      cookieBanner: /cookie/i.test(text),
+    };
+    console.log(scrub(`diagnostic (${label}): status=${response?.status() ?? 'n/a'} url=${page.url()} `
+      + `title="${await page.title().catch(() => '')}" markers=${JSON.stringify(markers)}`));
+    console.log(scrub(`diagnostic text: ${text.slice(0, 300)}`));
+  };
+
   try {
-    await page.goto(cfg.PROVINCE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const provinceRes = await page.goto(cfg.PROVINCE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await pause(2500, 5000);
-    await page.goto(cfg.TRAMITE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const tramiteRes = await page.goto(cfg.TRAMITE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await pause(2000, 4000);
 
     let text = await body();
-    if (looksBlocked(text)) return { result: 'blocked' };
-    if (!/INTERNET CITA PREVIA/i.test(text)) return { result: 'error', note: 'landing page not recognised' };
+    if (looksBlocked(text)) { await diagnose('landing blocked', tramiteRes); return { result: 'blocked' }; }
+    if (!/INTERNET CITA PREVIA/i.test(text)) {
+      await diagnose('landing', tramiteRes);
+      console.log(`diagnostic province page status=${provinceRes?.status() ?? 'n/a'}`);
+      return { result: 'error', note: 'landing page not recognised' };
+    }
 
     await page.click('#btnEntrar');
     await page.waitForSelector('#txtIdCitado', { timeout: 30000 });
@@ -221,6 +240,12 @@ async function handle(outcome) {
 
 // ---- main ----
 
+const pastTeardown = () => madridNow().date >= cfg.TEARDOWN_DATE;
+if (pastTeardown()) {
+  console.log(`Teardown date ${cfg.TEARDOWN_DATE} reached: not checking. See TEARDOWN.md.`);
+  process.exit(0);
+}
+
 if (!env.NIE_PASSPORT || !env.NIE_NAME) {
   console.error('NIE_PASSPORT and NIE_NAME must be set');
   process.exit(1);
@@ -236,7 +261,7 @@ let sinceSave = 0;
 do {
   await handle(await check(browser));
   if (++sinceSave >= 10 || !loop) { saveLog(); sinceSave = 0; }
-  if (!loop) break;
+  if (!loop || pastTeardown()) break;
 
   const interval = isDaytime(madridNow().hour) ? cfg.DAY_INTERVAL_MIN : cfg.NIGHT_INTERVAL_MIN;
   const wait = interval * 60000 + (Math.random() * 2 - 1) * cfg.JITTER_SEC * 1000;
