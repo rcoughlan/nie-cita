@@ -20,6 +20,8 @@ connections time out or get reset. So the scheduled run is off by default, and i
 
 If none of it works after a couple of weeks, see [ROUTES.md](ROUTES.md).
 
+Once she's booked, or by 31 Jan 2027 at the latest, take it all down: see [TEARDOWN.md](TEARDOWN.md).
+
 ## Privacy
 
 The passport number and name live only in Actions secrets (or a local, gitignored `.env`). They are

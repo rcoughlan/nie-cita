@@ -27,6 +27,10 @@ export const ACCEPTED_OFFICES = [
 export const DAY_START_HOUR = 7;
 export const DAY_END_HOUR = 1; // 01:00 next day
 
+// After this date (Madrid) the monitor and watchdog stop without touching the portal.
+// Tear down sooner once she's booked: see TEARDOWN.md. Env TEARDOWN_DATE overrides.
+export const TEARDOWN_DATE = process.env.TEARDOWN_DATE || '2027-01-31';
+
 export const DAY_INTERVAL_MIN = 4;
 export const NIGHT_INTERVAL_MIN = 15;
 export const JITTER_SEC = 60;
