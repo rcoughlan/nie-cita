@@ -1,11 +1,18 @@
 // Alert-only cita monitor. Walks the portal up to the office list and stops there:
-// it never books, never solves captchas, and never submits contact details.
+// it never books, never solves captchas, and never reaches the phone/email step.
 //
 //   node monitor.mjs           one check
 //   node monitor.mjs --loop    keep checking for LOOP_MINUTES (default 345)
+//   node --env-file=.env monitor.mjs   local run with secrets in a gitignored .env
 //
-// Env: NIE_PASSPORT, NIE_NAME (required), NIE_COUNTRY (default IRLANDA), NTFY_TOPIC,
-//      DATA_DIR (where checks.csv lives; pushed with git when set), PROXY_URL (optional).
+// Env: NIE_PASSPORT, NIE_NAME (required), NIE_COUNTRY (default IRLANDA),
+//      NTFY_TOPIC (shared: slot alerts only), NTFY_ADMIN_TOPIC (Ryan only: blocks, errors),
+//      DATA_DIR (where checks.csv lives; pushed with git when set), PROXY_URL (optional),
+//      MONITOR_HOST (label in the log, e.g. pi), HEADED=1 (show the browser locally).
+//
+// Privacy: the passport and name are only ever typed into the portal form. Nothing derived
+// from them is logged, written to checks.csv or sent to ntfy: errors are reduced to a fixed
+// category, and anything printed is scrubbed of both values first. No screenshots or traces.
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
@@ -16,7 +23,32 @@ import * as cfg from './config.mjs';
 const env = process.env;
 const DATA_DIR = env.DATA_DIR || '.';
 const LOG = path.join(DATA_DIR, 'checks.csv');
-const RUNNER = env.RUNNER_NAME ? 'gha' : (env.MONITOR_HOST || 'local');
+const RUNNER = (env.MONITOR_HOST || (env.RUNNER_NAME ? 'gha' : 'local')).replace(/[^\w-]/g, '');
+const ERROR_STREAK_ALERT = 5;
+
+// Every form of the personal values we might ever print: as given, upper/lower case,
+// without spaces, and each word of the name.
+const SECRETS = [env.NIE_PASSPORT, env.NIE_NAME]
+  .filter(Boolean)
+  .flatMap(v => [v, v.trim(), v.replace(/\s+/g, ''), ...v.split(/\s+/)])
+  .filter(v => v && v.length >= 3)
+  .flatMap(v => [v, v.toUpperCase(), v.toLowerCase()])
+  .sort((a, b) => b.length - a.length);
+
+function scrub(text) {
+  let out = String(text);
+  for (const s of SECRETS) out = out.split(s).join('[redacted]');
+  return out;
+}
+
+// Reduce any exception to a fixed category, so raw messages never reach the public log.
+function errorCategory(msg) {
+  if (/page\.goto: Timeout|net::ERR_TIMED_OUT/i.test(msg)) return 'timeout';
+  if (/net::/i.test(msg)) return 'network';
+  if (/waitForSelector|Timeout \d+ms exceeded/i.test(msg)) return 'element-timeout';
+  if (/Target .*closed|browser has been closed/i.test(msg)) return 'browser-closed';
+  return 'other';
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const pause = (min, max) => sleep(min + Math.random() * (max - min));
@@ -48,7 +80,7 @@ function readLog() {
 
 function appendLog(result, offices = []) {
   if (!fs.existsSync(LOG)) fs.writeFileSync(LOG, 'ts_utc,ts_madrid,result,offices,runner\n');
-  const clean = offices.map(o => o.replace(/[,\n]/g, ' ').trim()).join(' | ');
+  const clean = offices.map(o => scrub(o).replace(/[,\n]/g, ' ').trim()).join(' | ');
   fs.appendFileSync(LOG, [new Date().toISOString(), madridNow().stamp, result, clean, RUNNER].join(',') + '\n');
   console.log(`${madridNow().stamp} ${result}${clean ? ' ' + clean : ''}`);
 }
@@ -57,23 +89,29 @@ function saveLog() {
   if (!env.DATA_DIR) return;
   try {
     execFileSync('/bin/bash', [path.resolve('scripts/save-log.sh'), DATA_DIR], { stdio: 'inherit' });
-  } catch (e) {
-    console.log('save-log failed:', e.message);
+  } catch {
+    console.log('save-log failed');
   }
 }
 
 // ---- notifications ----
+// NTFY_TOPIC is shared with her and only ever gets slot alerts.
+// NTFY_ADMIN_TOPIC is Ryan's alone and gets everything operational.
 
-async function notify(title, message, { priority = 'default', tags = '', click } = {}) {
-  if (!env.NTFY_TOPIC) return console.log(`[no NTFY_TOPIC] ${title}: ${message}`);
+async function notify(topic, title, message, { priority = 'default', tags = '', click } = {}) {
+  title = scrub(title);
+  message = scrub(message);
+  if (!topic) return console.log(`[no topic] ${title}: ${message}`);
   const headers = { Title: title, Priority: priority, Tags: tags };
   if (click) headers.Click = click;
   try {
-    await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: 'POST', body: message, headers });
-  } catch (e) {
-    console.log('ntfy failed:', e.message);
+    await fetch(`https://ntfy.sh/${topic}`, { method: 'POST', body: message, headers });
+  } catch {
+    console.log('ntfy failed');
   }
 }
+const notifyShared = (...a) => notify(env.NTFY_TOPIC, ...a);
+const notifyAdmin = (...a) => notify(env.NTFY_ADMIN_TOPIC, ...a);
 
 // ---- one check ----
 
@@ -139,8 +177,9 @@ async function check(browser) {
     return { result: 'error', note: 'unexpected page after Solicitar Cita' };
   } catch (e) {
     const msg = String(e.message || e);
-    if (/net::|page\.goto: Timeout/i.test(msg)) return { result: 'blocked', note: msg.split('\n')[0] };
-    return { result: 'error', note: msg.split('\n')[0] };
+    if (!env.CI) console.log('debug:', scrub(msg.split('\n')[0]));
+    const category = errorCategory(msg);
+    return { result: ['timeout', 'network'].includes(category) ? 'blocked' : 'error', note: category };
   } finally {
     await context.close().catch(() => {});
   }
@@ -157,7 +196,7 @@ async function handle(outcome) {
     const accepted = outcome.offices.filter(o => cfg.ACCEPTED_OFFICES.some(re => re.test(o)));
     appendLog(accepted.length ? 'slots' : 'slots_other', outcome.offices);
     if (accepted.length && day) {
-      await notify('NIE cita available - book now', `Offices with slots:\n${accepted.join('\n')}\n\nTrámite: ${cfg.TRAMITE_LABEL}\nTap to open the portal.`,
+      await notifyShared('NIE cita available - book now', `Offices with slots:\n${accepted.join('\n')}\n\nTrámite: ${cfg.TRAMITE_LABEL}\nTap to open the portal.`,
         { priority: 'urgent', tags: 'rotating_light', click: cfg.PROVINCE_URL });
     }
     return;
@@ -166,23 +205,18 @@ async function handle(outcome) {
   appendLog(outcome.result, outcome.note ? [outcome.note] : []);
   const bad = ['blocked', 'captcha'];
   if (bad.includes(outcome.result) && !bad.includes(prev)) {
-    await notify('NIE monitor blocked', `The portal returned "${outcome.result}" from ${RUNNER}. Checks continue; you'll hear when it recovers.`, { priority: 'high', tags: 'warning' });
+    await notifyAdmin('NIE monitor blocked', `The portal returned "${outcome.result}" (${outcome.note || 'no detail'}) from ${RUNNER}. Checks continue; you'll hear when it recovers.`, { priority: 'high', tags: 'warning' });
   } else if (!bad.includes(outcome.result) && outcome.result !== 'error' && bad.includes(prev)) {
-    await notify('NIE monitor recovered', `Portal reachable again from ${RUNNER}.`, { tags: 'white_check_mark' });
+    await notifyAdmin('NIE monitor recovered', `Portal reachable again from ${RUNNER}.`, { tags: 'white_check_mark' });
   }
-}
 
-async function maybeHeartbeat() {
-  const now = madridNow();
-  if (now.hour !== cfg.HEARTBEAT_HOUR) return;
-  const today = readLog().filter(r => r.ts_madrid?.startsWith(now.date));
-  if (today.some(r => r.result === 'heartbeat')) return;
-  const count = k => today.filter(r => r.result === k).length;
-  const checks = today.filter(r => r.result !== 'heartbeat').length;
-  await notify('NIE monitor: still running',
-    `Today: ${checks} checks, ${count('slots')} with slots, ${count('none')} empty, ${count('blocked') + count('captcha')} blocked, ${count('error')} errors.`,
-    { priority: 'low', tags: 'heartbeat' });
-  appendLog('heartbeat');
+  if (outcome.result === 'error') {
+    const recent = readLog().slice(-ERROR_STREAK_ALERT);
+    if (recent.length === ERROR_STREAK_ALERT && recent.every(r => r.result === 'error')
+      && readLog().at(-ERROR_STREAK_ALERT - 1)?.result !== 'error') {
+      await notifyAdmin('NIE monitor erroring', `${ERROR_STREAK_ALERT} checks in a row failed on ${RUNNER} (latest: ${outcome.note}). The portal may have changed; the script probably needs a fix.`, { priority: 'high', tags: 'warning' });
+    }
+  }
 }
 
 // ---- main ----
@@ -192,7 +226,7 @@ if (!env.NIE_PASSPORT || !env.NIE_NAME) {
   process.exit(1);
 }
 
-const launchOpts = { headless: true };
+const launchOpts = { headless: !env.HEADED };
 if (env.PROXY_URL) launchOpts.proxy = { server: env.PROXY_URL };
 const browser = await chromium.launch(launchOpts);
 const loop = process.argv.includes('--loop');
@@ -201,7 +235,6 @@ let sinceSave = 0;
 
 do {
   await handle(await check(browser));
-  await maybeHeartbeat();
   if (++sinceSave >= 10 || !loop) { saveLog(); sinceSave = 0; }
   if (!loop) break;
 

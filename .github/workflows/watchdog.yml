@@ -1,0 +1,32 @@
+name: watchdog
+on:
+  schedule:
+    - cron: '17 */3 * * *'   # every 3h; the 09:17 UTC run also does the daily/review checks
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'auto | daily | review | test'
+        default: 'test'
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node watchdog.mjs data/checks.csv
+        env:
+          NTFY_ADMIN_TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC }}
+          MONITOR_ENABLED: ${{ vars.MONITOR_ENABLED }}
+          REVIEW_DATE: ${{ vars.REVIEW_DATE }}
+          MODE: ${{ inputs.mode || 'auto' }}
