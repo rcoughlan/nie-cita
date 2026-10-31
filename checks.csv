@@ -2,3 +2,4 @@ ts_utc,ts_madrid,result,offices,runner
 2026-10-31T10:54:40.649Z,2026-10-31 11:54,error,page.goto: Timeout 60000ms exceeded.,gha
 2026-10-31T10:56:52.058Z,2026-10-31 11:56,blocked,page.goto: Timeout 60000ms exceeded.,gha
 2026-10-31T11:13:28.278Z,2026-10-31 12:13,blocked,timeout,gha
+2026-10-31T11:39:11.018Z,2026-10-31 12:39,error,landing page not recognised,gha-nord
