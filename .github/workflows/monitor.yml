@@ -2,8 +2,6 @@ name: monitor
 on:
   schedule:
     - cron: '0 */6 * * *'   # each run loops for ~5h45m, so this keeps it continuous
-  push:
-    branches: [feat/monitor]   # TEMP: test before merge
   workflow_dispatch:
     inputs:
       minutes:
