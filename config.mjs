@@ -30,5 +30,3 @@ export const DAY_END_HOUR = 1; // 01:00 next day
 export const DAY_INTERVAL_MIN = 4;
 export const NIGHT_INTERVAL_MIN = 15;
 export const JITTER_SEC = 60;
-
-export const HEARTBEAT_HOUR = 21; // daily "still alive" push, Madrid time

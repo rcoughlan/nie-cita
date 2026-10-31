@@ -2,3 +2,8 @@ node_modules/
 .env
 *.png
 explore*.mjs
+/checks.csv
+/data/
+test-results/
+playwright-report/
+*.zip

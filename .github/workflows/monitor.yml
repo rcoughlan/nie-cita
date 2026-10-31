@@ -21,6 +21,9 @@ jobs:
     if: github.event_name != 'schedule' || vars.MONITOR_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 355
+    env:
+      NORD_USER: ${{ secrets.NORD_USER }}
+      NORD_PASS: ${{ secrets.NORD_PASS }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -33,12 +36,17 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
+      # Optional: route through a NordVPN server in Spain when the service credentials are set.
+      - name: Connect NordVPN (Spain)
+        if: env.NORD_USER != ''
+        run: /bin/bash scripts/nord-connect.sh
       - name: Check
         env:
           NIE_PASSPORT: ${{ secrets.NIE_PASSPORT }}
           NIE_NAME: ${{ secrets.NIE_NAME }}
           NIE_COUNTRY: ${{ secrets.NIE_COUNTRY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_ADMIN_TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           DATA_DIR: data
           LOOP_MINUTES: ${{ inputs.minutes || '345' }}
@@ -48,3 +56,11 @@ jobs:
           else
             node monitor.mjs
           fi
+      - name: Alert on failure
+        if: failure()
+        env:
+          NTFY_ADMIN_TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC }}
+        run: |
+          curl -s -H "Title: NIE monitor run failed" -H "Priority: high" -H "Tags: warning" \
+            -d "GitHub Actions run failed before or during checks: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_ADMIN_TOPIC"
