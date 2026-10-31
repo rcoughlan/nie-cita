@@ -201,9 +201,9 @@ async function minimise(p) {
 // ---- one check ----
 
 async function check() {
+  // Cookies persist across checks within one run (a fresh browser starts clean), so the portal's
+  // rate limiting sees one ordinary visitor; we don't clear cookies to dodge it.
   const page = await getPage();
-  // Start each check with a fresh portal session.
-  await page.context().clearCookies().catch(() => {});
   const body = async () => (await page.locator('body').innerText({ timeout: 15000 }).catch(() => '')) || '';
   const looksBlocked = t => /requested url was rejected|request rejected|access denied|support id|intrusion prevention/i.test(t);
   const blockNote = t => (/intrusion prevention/i.test(t) ? 'firewall' : 'rejected');
