@@ -1,0 +1,50 @@
+name: monitor
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # each run loops for ~5h45m, so this keeps it continuous
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'How long to loop (0 = single check)'
+        default: '0'
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    # Scheduled runs only fire once the repo variable MONITOR_ENABLED is 'true'.
+    if: github.event_name != 'schedule' || vars.MONITOR_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Check
+        env:
+          NIE_PASSPORT: ${{ secrets.NIE_PASSPORT }}
+          NIE_NAME: ${{ secrets.NIE_NAME }}
+          NIE_COUNTRY: ${{ secrets.NIE_COUNTRY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          DATA_DIR: data
+          LOOP_MINUTES: ${{ inputs.minutes || '345' }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.minutes || '0' }}" != "0" ]; then
+            node monitor.mjs --loop
+          else
+            node monitor.mjs
+          fi
